@@ -6,7 +6,7 @@ export default function SessionHistoryPage({ onBack, onOpenReport, backendUrl })
   const [sessions, setSessions] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  const BACKEND_URL = backendUrl || process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8010";
+  const BACKEND_URL = backendUrl || process.env.REACT_APP_BACKEND_URL || window.location.origin;
 
   useEffect(() => {
     const fetchSessions = async () => {
