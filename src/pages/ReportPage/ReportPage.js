@@ -11,11 +11,10 @@ export default function ReportPage({ data, sessionId, onBack, backendUrl }) {
   const [loading, setLoading] = useState(true);
 
   // Use the dynamic backend URL logic below
-  const BACKEND_URL =
+    const BACKEND_URL =
     backendUrl ||
     process.env.REACT_APP_BACKEND_URL ||
-    "http://127.0.0.1:8010";
-
+    window.location.origin;
   // 🧠 Fetch report from FastAPI
   useEffect(() => {
     const fetchReport = async () => {
