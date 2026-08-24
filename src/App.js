@@ -6,7 +6,7 @@ import ReportPage from "./pages/ReportPage/ReportPage";
 import SessionHistoryPage from "./pages/SessionHistoryPage/SessionHistoryPage";
 
 // ✅ Load backend URL from environment variable
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:8010";
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || window.location.origin;
 
 console.log("🔗 Backend URL:", BACKEND_URL);
 
