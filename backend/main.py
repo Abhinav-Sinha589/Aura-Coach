@@ -43,7 +43,7 @@ app.add_middleware(
     # ✅ Also allow any *.devtunnels.ms origin, so a fresh tunnel URL
     # (which changes when VS Code regenerates it) keeps working without
     # needing a code change every time.
-    allow_origin_regex=r"https://.*\.devtunnels\.ms",
+    allow_origin_regex=r"https://.*\.(devtunnels\.ms|onrender\.com)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -335,8 +335,25 @@ async def list_sessions():
 
 
 # -------------------------------------------
-# 🏠 Root endpoint
+# 🏠 Serve the React build (single-service deploy)
 # -------------------------------------------
-@app.get("/")
-async def root():
-    return {"message": "Aura Coach backend running with real-time persistent speech analysis ✅"}
+BUILD_DIR = os.path.join(os.path.dirname(__file__), "build")
+
+if os.path.isdir(BUILD_DIR):
+    app.mount(
+        "/static",
+        StaticFiles(directory=os.path.join(BUILD_DIR, "static")),
+        name="static",
+    )
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        candidate = os.path.join(BUILD_DIR, full_path)
+        if full_path and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        return FileResponse(os.path.join(BUILD_DIR, "index.html"))
+
+else:
+    @app.get("/")
+    async def root():
+        return {"message": "Aura Coach backend running (no frontend build found) ✅"}
