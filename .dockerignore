@@ -1,0 +1,13 @@
+node_modules
+backend/venv
+__pycache__
+*.pyc
+.git
+.gitignore
+.env
+.env.local
+data/raw/*.json
+*.log
+.vscode
+.idea
+docs/screenshots

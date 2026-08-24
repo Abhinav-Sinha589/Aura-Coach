@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: aura-coach
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /api/models/status
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONIOENCODING
+        value: "utf-8"

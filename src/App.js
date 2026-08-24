@@ -5,8 +5,12 @@ import TrainingPage from "./pages/TrainingPage/TrainingPage";
 import ReportPage from "./pages/ReportPage/ReportPage";
 import SessionHistoryPage from "./pages/SessionHistoryPage/SessionHistoryPage";
 
-// ✅ Load backend URL from environment variable
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || window.location.origin;
+// ✅ Load backend URL from environment variable or auto-resolve to current origin in cloud deployment
+const BACKEND_URL =
+  process.env.REACT_APP_BACKEND_URL ||
+  (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1"
+    ? window.location.origin
+    : "http://localhost:8010");
 
 console.log("🔗 Backend URL:", BACKEND_URL);
 

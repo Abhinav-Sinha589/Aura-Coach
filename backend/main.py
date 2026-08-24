@@ -28,22 +28,24 @@ app = FastAPI()
 @app.on_event("startup")
 async def _load_ml_models():
     # Loads backend/models/performance_model.joblib and tone_model.joblib
-    # (run backend/ml/train_performance_model.py and train_tone_model.py
-    # once before starting the server if these don't exist yet)
     load_models()
 
 
-# ✅ Updated CORS setup — supports VS Code dev tunnels
+# ✅ Production CORS setup — supports localhost, Dev Tunnels, and Render domains
+raw_custom_origins = os.environ.get("ALLOWED_ORIGINS", "")
+custom_origins = [o.strip() for o in raw_custom_origins.split(",") if o.strip()]
+
+default_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://d32w6h95-3000.inc1.devtunnels.ms",
+]
+allowed_origins = list(set(default_origins + custom_origins)) if "*" not in custom_origins else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",                     # Local React dev
-        "https://d32w6h95-3000.inc1.devtunnels.ms",  # Your existing tunnel
-    ],
-    # ✅ Also allow any *.devtunnels.ms origin, so a fresh tunnel URL
-    # (which changes when VS Code regenerates it) keeps working without
-    # needing a code change every time.
-    allow_origin_regex=r"https://.*\.(devtunnels\.ms|onrender\.com)",
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*(\.devtunnels\.ms|\.onrender\.com)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -335,25 +337,47 @@ async def list_sessions():
 
 
 # -------------------------------------------
-# 🏠 Serve the React build (single-service deploy)
+# 🏠 Frontend Static Assets & SPA Routing
 # -------------------------------------------
-BUILD_DIR = os.path.join(os.path.dirname(__file__), "build")
+BUILD_DIR = None
+candidate_paths = [
+    os.path.join(os.path.dirname(__file__), "build"),
+    os.path.join(os.path.dirname(__file__), "..", "build"),
+    os.path.join(os.path.dirname(__file__), "..", "dist"),
+    "/app/build",
+    "/app/backend/build",
+]
 
-if os.path.isdir(BUILD_DIR):
-    app.mount(
-        "/static",
-        StaticFiles(directory=os.path.join(BUILD_DIR, "static")),
-        name="static",
-    )
+for p in candidate_paths:
+    if os.path.exists(p) and os.path.isdir(p) and os.path.exists(os.path.join(p, "index.html")):
+        BUILD_DIR = os.path.abspath(p)
+        break
+
+if BUILD_DIR:
+    print(f"📦 Serving static frontend from: {BUILD_DIR}")
+    static_subdir = os.path.join(BUILD_DIR, "static")
+    if os.path.exists(static_subdir):
+        app.mount("/static", StaticFiles(directory=static_subdir), name="static")
+
+    models_subdir = os.path.join(BUILD_DIR, "models")
+    if os.path.exists(models_subdir):
+        app.mount("/models", StaticFiles(directory=models_subdir), name="face_models")
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
-        candidate = os.path.join(BUILD_DIR, full_path)
-        if full_path and os.path.isfile(candidate):
-            return FileResponse(candidate)
+        # Don't intercept API routes (safety check)
+        if full_path.startswith("api/") or full_path == "api":
+            return {"error": "API route not found"}
+        
+        # If requested file exists in build folder, serve it
+        requested_file = os.path.join(BUILD_DIR, full_path)
+        if full_path and os.path.exists(requested_file) and os.path.isfile(requested_file):
+            return FileResponse(requested_file)
+        
+        # Otherwise fallback to index.html for client-side routing
         return FileResponse(os.path.join(BUILD_DIR, "index.html"))
-
 else:
     @app.get("/")
     async def root():
-        return {"message": "Aura Coach backend running (no frontend build found) ✅"}
+        return {"message": "Aura Coach backend running with real-time persistent speech analysis ✅"}
+

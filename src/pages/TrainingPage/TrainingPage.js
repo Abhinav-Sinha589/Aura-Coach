@@ -14,9 +14,16 @@ export default function TrainingPage({ onEndSession, onBack, streamRef, backendU
   const audioStreamRef = useRef(null);
 
   // Use the same backend URL logic as the rest of the app instead of hardcoding it
-  const BACKEND_URL = backendUrl || process.env.REACT_APP_BACKEND_URL || window.location.origin;
+  const BACKEND_URL =
+    backendUrl ||
+    process.env.REACT_APP_BACKEND_URL ||
+    (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1"
+      ? window.location.origin
+      : "http://127.0.0.1:8010");
   // Convert http(s) backend URL into the matching ws(s) URL for the audio stream
-  const WS_URL = BACKEND_URL.replace(/^http/, "ws") + "/api/audio-stream";
+  const WS_URL =
+    BACKEND_URL.replace(/^http(s)?:\/\//i, (match, isHttps) => (isHttps ? "wss://" : "ws://")) +
+    "/api/audio-stream";
 
   const [metrics, setMetrics] = useState({
     posture: 0,
