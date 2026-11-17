@@ -7,19 +7,19 @@ A real-time public-speaking coach. Turn on your camera and mic, start talking, a
 The live training screen is a three-panel layout: your camera feed in the center, with two stat panels on either side that update continuously while you speak.
 
 **Body Language Analysis** (left panel)
-- **Posture Score** — a 0–100% score from MediaPipe Pose landmark tracking
-- **Head Tilt** — current head angle in degrees
-- **Eye Contact** — Good / Needs Work, from gaze direction relative to the camera
+- **Posture Score** — a 0–100% shoulder-level score from MediaPipe Pose landmark tracking
+- **Shoulder Tilt** — current aspect-ratio-corrected shoulder line angle in degrees
+- **Camera Alignment (approx.)** — Good / Looking Away, estimated from nose horizontal centering relative to the frame (a proxy for facing the camera, not true eye-gaze tracking; internal model key remains `eyeContact` for trained-pipeline compatibility)
 
 **Speaking Style Feedback** (right panel)
-- **Speaking Pace** — live words-per-minute
-- **Filler Words** — running count of "um," "uh," "like," etc.
-- **Emotion** — facial expression read via face-api.js (e.g. happy, neutral, nervous)
-- **Tone** — vocal tone classified live as Calm / Balanced / Energetic / Noise
-- **Volume** — current loudness (RMS)
-- **Pitch** — current vocal pitch
+- **Speaking Pace (incl. pauses)** — live words-per-minute computed from finalized browser SpeechRecognition transcripts over elapsed capture time
+- **Filler Words (heuristic)** — running count of finalized single-word ("um", "uh", "like", "basically", "actually") and multiword ("you know", "I mean", "kind of", "sort of") fillers
+- **Expression Estimate** — facial expression estimate via `face-api.js` (e.g. Happy, Neutral)
+- **Tone** — vocal tone classified live as Calm / Balanced / Energetic / Noise from 1.5-second resampled audio windows
+- **Volume (RMS×100)** — current loudness on the `RMS × 100` scale
+- **Pitch** — current fundamental frequency (Hz) on voiced windows (`Unavailable` during silence)
 
-**Live Tips** (below the camera) — short, real-time nudges generated from your current metrics, e.g. "Speak louder," "Slow down," "Try to look at the camera more."
+**Live Tips** (below the camera) — short, real-time nudges generated from your current metrics (e.g. "Low mic input level", "Straighten your shoulder alignment", "Center yourself toward the camera").
 
 After you end a session, the **Report page** shows a summary, rule-based insights/recommendations, and an **ML Performance Score (0–100)** from the trained regressor — not just an average of the raw numbers, but a model that's learned how these metrics interact (e.g. fast pace only hurts the score when filler words are also high).
 
@@ -61,8 +61,8 @@ This is the screen shown in the example below — note all the right-panel stats
 ### Report Page
 Shown after you end a session:
 
-- **Session Summary card** — the headline **🧠 ML Performance Score** badge (0–100, from the trained regressor) alongside quick-glance stats: WPM, Posture, Eye Contact, Volume, Emotion.
-- **Pacing & Confidence Trend chart** — a line chart plotting Posture ("Confidence") and WPM ("Pacing") across five checkpoints through the session (Start → 1 min → 2 min → 3 min → End), so you can see whether you faded or held steady.
+- **Session Summary card** — the headline **🧠 Estimated Performance Score (heuristic model)** badge (0–100, from the trained regressor; withheld if essential metrics WPM or posture were not measured) alongside session averages: WPM, Posture, Camera Alignment, Volume, Expression.
+- **Pacing & Posture Timeline** — a dual-axis line chart plotting actual timestamped Posture (%) and Speaking Pace (WPM) checkpoints recorded during the session. For legacy sessions or short runs without recorded timeline checkpoints, it displays `No session timeline recorded` instead of fabricating trend points.
 - **Insights** — rule-based observations on what happened in the session.
 - **Recommendations** — concrete suggestions for the next attempt.
 
@@ -155,16 +155,25 @@ Open `http://localhost:3000`, click **Start Session**, allow camera/mic access.
 | `/api/sessions` | GET | List saved sessions |
 | `/api/models/status` | GET | Health check confirming both ML models loaded |
 
-## Docker
+## Docker & Deployment
 
 ```bash
 docker build -t aura-coach .
-docker run -p 8080:8080 aura-coach
+docker run -p 10000:10000 aura-coach
 ```
 
-The build trains both models from `data/raw/`. Fewer than 10 sessions there will fail the build — seed sample sessions first, or train locally and commit the `.joblib` files in `backend/models/` instead.
+The multi-stage `Dockerfile` builds the React frontend (`npm run build`) and serves it from the FastAPI container alongside the pre-trained `.joblib` models in `backend/models/` (it does **not** retrain models during build).
 
-## Notes
+## Supported Browsers, Audio Flow & Limitations
 
-- `data/raw/` is gitignored by default since it's personal session data.
-- CORS in `backend/main.py` currently allows `localhost:3000` and `*.devtunnels.ms`; update `allow_origins` / `allow_origin_regex` for other deployments.
+- **Supported browsers:** Desktop Chromium browsers (**Google Chrome** or **Microsoft Edge**) are required for full functionality because the Web Speech API (`SpeechRecognition` / `webkitSpeechRecognition`) is not supported in Firefox and has limited continuous-mode behavior in Safari. When SpeechRecognition is unavailable or microphone permission is denied, WPM and fillers are reported as `Unavailable` (`null`) rather than `0`.
+- **Audio sample-rate & windowing flow:** The browser reads the actual hardware `AudioContext.sampleRate` (commonly 44.1 kHz or 48 kHz) and sends a `{type: "start", session_id, sample_rate, channels: 1, encoding: "pcm_s16le"}` handshake before streaming binary PCM16LE packets. The backend accumulates a rolling **1.5-second analysis window** with a **0.5-second hop**, resamples the complete window to **16 kHz** via `scipy.signal.resample_poly`, and extracts features (`rms`, `pitch_mean`, `pitch_std`, `spectral_centroid`, `zero_crossing_rate`). On session stop, the client sends `{type: "finish"}` and awaits `{type: "finished"}` before calling `POST /api/session/log`.
+- **Model caveats:**
+  - `backend/models/tone_model.joblib` was trained on synthetic 1.5 s @ 16 kHz waveforms (`train_tone_model.py`), not labeled human speech recordings. Silence/unvoiced windows report `pitch: null` and `tone: null`.
+  - `backend/models/performance_model.joblib` was trained on 78 historical session JSONs whose target score was bootstrapped from a heuristic formula (`compute_target_score` in `train_performance_model.py`), not external human ratings. When essential inputs (`wpm` or `posture`) are unmeasured (`null`), the score is withheld (`null`).
+  - Both models were serialized with `scikit-learn==1.8.0` and `numpy>=2.0`, which are pinned in `backend/requirements.txt`.
+- **Session storage, privacy & Render ephemerality:**
+  - Completed sessions are written atomically as JSON files under `data/raw/` (or `AURA_DATA_DIR`), which is gitignored. Raw audio waveforms and raw transcripts are **not** persisted to disk.
+  - In-memory audio summaries (`AUDIO_SUMMARIES`) are bounded with a TTL and live inside a single Uvicorn process (not shared across multiple workers).
+  - On Render's free tier (`render.yaml`), the container filesystem is **ephemeral**: saved sessions in `/app/data/raw` are reset whenever the service redeploys or restarts unless backed by a persistent disk.
+  - **CORS & WebSocket protocol:** In single-service Render deployment, the frontend and FastAPI backend share the same origin (`https://` and `wss://`). For separate frontend origins, set `ALLOWED_ORIGINS` (comma-separated explicit origins).
