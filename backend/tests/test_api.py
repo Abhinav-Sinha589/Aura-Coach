@@ -250,3 +250,11 @@ def test_resolve_build_file_blocks_traversal(tmp_path):
     assert resolve_build_file(str(build), "index.html")
     assert resolve_build_file(str(build), "../secret.txt") is None
     assert resolve_build_file(str(build), "/etc/passwd") is None
+
+
+def test_all_empty_trend_is_not_a_trend():
+    from backend.sessions import clean_trend
+    assert clean_trend({"t": [5, 10], "posture": [None, None], "wpm": [None, None]}) is None
+    assert clean_trend({"t": [5, 10], "posture": [None, 80], "wpm": [None, None]}) == {
+        "t": [5.0, 10.0], "posture": [None, 80.0]}
+    assert clean_trend({"t": [5]}) is None

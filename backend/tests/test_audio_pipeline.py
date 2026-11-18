@@ -124,3 +124,27 @@ def test_analysis_latency_is_bounded():
     msgs, _ = run_stream(voice_like(150, 48000, 4.0), 48000)
     lat = [m["latency_ms"] for m in msgs[3:]]
     assert max(lat) < 400, lat  # hop is 500 ms
+
+
+def test_burst_is_analysed_hop_by_hop_not_skipped():
+    """Audio queued while the socket opened arrives in one burst (~2 s)."""
+    agg = ap.SessionAudioAggregate("session_burst")
+    an = ap.StreamAnalyzer(48000, agg, tone_proba_fn=predict_tone_proba)
+    an.push(voice_like(150, 48000, 2.0))          # one burst
+    msgs = []
+    while an.has_hop():
+        msgs.append(an.analyze())
+    assert len(msgs) == 4 and agg.skipped_hops == 0
+    assert [m["t"] for m in msgs] == [0.5, 1.0, 1.5, 2.0]
+
+
+def test_long_backlog_skips_to_realtime():
+    agg = ap.SessionAudioAggregate("session_lag")
+    an = ap.StreamAnalyzer(16000, agg, tone_proba_fn=predict_tone_proba)
+    an.push(voice_like(150, 16000, 10.0))
+    n = 0
+    while an.has_hop():
+        an.analyze()
+        n += 1
+    assert agg.skipped_hops > 0 and n < 20
+    assert agg.audio_seconds == pytest.approx(10.0)

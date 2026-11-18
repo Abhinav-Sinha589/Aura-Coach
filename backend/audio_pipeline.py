@@ -73,6 +73,8 @@ PYIN_CONTEXT_SEC = 0.75     # only the most recent audio is pitch-tracked
 MIN_RECENT_VOICED = 4       # frames (~128 ms) before a pitch is reported
 
 TONE_SMOOTHING_WINDOWS = 3
+MAX_CATCHUP_HOPS = 6        # a burst (e.g. audio queued while the socket opened) is
+                            # analysed hop by hop; beyond this we skip to the newest
 TONE_HOLD_SEC = 2.0
 PITCH_HOLD_SEC = 1.0
 
@@ -237,7 +239,7 @@ class StreamAnalyzer:
             return
         with self._lock:
             self._buf = np.concatenate([self._buf, samples.astype(np.float32, copy=False)])
-            keep = self.window_n + self.hop_n
+            keep = self.window_n + (MAX_CATCHUP_HOPS + 1) * self.hop_n
             if self._buf.size > keep:
                 self._buf = self._buf[-keep:]
             self._pending += samples.size
@@ -265,18 +267,25 @@ class StreamAnalyzer:
                 return None
             if not final and pending < self.hop_n:
                 return None
-            window = self._buf[-self.window_n:].copy()
-            hop = self._buf[-min(pending, self.hop_n):].copy()
-            skipped = max(0, pending // self.hop_n - 1)
-            self._pending = 0
-            stream_t = self._total / self.sr
+            skipped = 0
+            if pending > MAX_CATCHUP_HOPS * self.hop_n:
+                # too far behind: drop the oldest backlog, keep real-time
+                skipped = pending // self.hop_n - 1
+                pending = self._pending = pending - skipped * self.hop_n
+            n_new = min(pending, self.hop_n)
+            lag = pending - n_new          # samples received after this hop
+            end = self._buf.size - lag
+            window = self._buf[max(0, end - self.window_n):end].copy()
+            hop = self._buf[max(0, end - n_new):end].copy()
+            self._pending = pending - n_new
+            stream_t = (self._total - lag) / self.sr
 
         t0 = time.perf_counter()
         agg = self.aggregate
         agg.touch()
         agg.hops += 1
         agg.skipped_hops += skipped
-        agg.audio_seconds += pending / self.sr
+        agg.audio_seconds += (n_new + skipped * self.hop_n) / self.sr
 
         window = window - float(np.mean(window)) if window.size else window
         hop = hop - float(np.mean(hop)) if hop.size else hop

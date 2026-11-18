@@ -76,19 +76,48 @@ stays the same.
 ## How it's wired into the app
 
 - `backend/model_loader.py` loads both `.joblib` files once at FastAPI
-  startup (`@app.on_event("startup")`) and exposes `predict_performance_score()`
-  and `predict_tone()`.
-- `/api/audio-stream` (websocket) now calls `predict_tone()` on every
-  audio chunk instead of the old threshold rule.
-- `/api/report/{session_id}` now includes an `ml_performance_score`
-  field alongside the existing rule-based summary/insights/recommendations.
-- `/api/predict/performance` (new) lets you POST an arbitrary feature
-  set and get a score back directly — handy for testing or a future
-  "what-if" feature in the UI.
-- `/api/models/status` (new) is a quick health check confirming both
-  models loaded.
-- The frontend (`ReportPage.js`) displays the ML score as a badge next
-  to the session summary.
+  startup (lifespan handler) and exposes `predict_performance_score()`,
+  `predict_tone()` and `predict_tone_proba()`. The artifacts are never
+  modified or re-serialised; scikit-learn is pinned to **1.8.0**, the version
+  they were pickled with.
+- `backend/ml/session_features.py` holds `clean_sessions()`, the exact
+  preprocessing used at training time (numeric coercion, clipping
+  wpm 0–260 / posture 0–100 / fillers 0–50 / volume 0–5 / pitch 0–500,
+  `"Detecting..."` → `Neutral`, missing eye contact → `Unknown`). Both
+  `train_performance_model.py` and the report endpoint import it, so
+  inference sees features exactly as training did.
+- `/api/audio-stream` buffers audio at the browser's real sample rate and,
+  every 0.5 s, resamples the latest **1.5 s** window to **16 kHz** — the
+  clip length and rate the tone classifier was trained on — before calling
+  the unchanged `extract_features_from_waveform()`. Silent windows are not
+  classified; the last three windows' class probabilities are averaged for
+  display. (Previously each ~43 ms browser chunk was classified on its own
+  and decoded as 16 kHz regardless of the real 44.1/48 kHz rate, which put
+  pitch and spectral centroid ~3× too low.)
+- `/api/report/{session_id}` includes `ml_performance_score` plus
+  `ml_score_note`, which lists any inputs that weren't measured in that
+  session (they are filled with the training-time defaults above).
+- `/api/predict/performance` lets you POST an arbitrary feature set and get
+  a score back directly.
+- `/api/models/status` reports both models, their classes/features, the
+  installed scikit-learn version and any unpickling warnings.
+
+## What the reported metrics do and don't mean
+
+- **Tone classifier (98% test / 99.6% CV):** measured on held-out
+  *synthetic* clips from the same generator as the training data. It shows
+  the forest separates the four synthetic profiles; it is not an accuracy
+  figure for real voices. Real-speech accuracy needs labelled recordings.
+- **Performance regressor (R² 0.96 / MAE 1.9 on 78 sessions):** the target
+  is the bootstrapped `compute_target_score()` formula, so these numbers
+  measure how faithfully the forest reproduces that formula on held-out
+  sessions. Note that some of those 78 training sessions were logged by the
+  earlier app version, whose `avg_wpm` was a loudness-derived estimate and
+  whose posture/eye-contact values were last-frame snapshots; the live
+  pipeline now supplies real recognised-word WPM and session averages.
+- Improving real-world accuracy beyond the signal-correctness fixes needs
+  data: labelled tone recordings, human-rated sessions, and (for gaze)
+  ground-truth camera-looking annotations.
 
 ## Training / retraining
 
@@ -103,6 +132,5 @@ Both scripts print evaluation metrics to the console and write:
 - `backend/models/performance_model.joblib` + `performance_model_meta.json`
 - `backend/models/tone_model.joblib` + `tone_model_meta.json`
 
-The Dockerfile now runs both training scripts during the image build,
-so a freshly built container ships with trained models already present
-(provided `data/raw/` has at least 10 sessions — seed it if needed).
+Retraining replaces the artifacts the app ships with; the Docker build does
+**not** train — it uses the committed `.joblib` files.

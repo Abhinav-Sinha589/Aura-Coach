@@ -66,8 +66,11 @@ def session_metrics(record: dict) -> dict:
 
     posture = _num(record.get("posture"))
     head_tilt = _num(record.get("headTilt"))
+    head_tilt_abs = _num(record.get("head_tilt_abs_mean"))
+    if head_tilt_abs is None and head_tilt is not None:
+        head_tilt_abs = abs(head_tilt)
     if pose is False:
-        posture = head_tilt = None
+        posture = head_tilt = head_tilt_abs = None
 
     eye = record.get("eyeContact")
     eye = eye if eye in EYE_CONTACT_LABELS else None
@@ -94,6 +97,7 @@ def session_metrics(record: dict) -> dict:
         "fillers": int(fillers) if fillers is not None else None,
         "posture": round(posture) if posture is not None else None,
         "head_tilt": round(head_tilt, 1) if head_tilt is not None else None,
+        "head_tilt_abs": round(head_tilt_abs, 1) if head_tilt_abs is not None else None,
         "eye_contact": eye,
         "eye_contact_ratio": _num(record.get("eye_contact_ratio")),
         "emotion": emotion,
@@ -131,7 +135,9 @@ def clean_trend(trend: Any) -> Optional[dict]:
     for key in ("posture", "wpm", "volume"):
         series = trend.get(key)
         if isinstance(series, list) and len(series) >= n:
-            out[key] = [_num(x) for x in series[:n]]
+            values = [_num(x) for x in series[:n]]
+            if any(v is not None for v in values):  # an all-empty series is no trend
+                out[key] = values
     return out if len(out) > 1 else None
 
 
@@ -179,8 +185,8 @@ def build_report(record: dict, ml_score: Optional[float], score_note: Optional[s
         "tone": (f"Vocal tone was mostly {tone.lower()}." if tone
                  else "Vocal tone was not measured (no voiced audio analysed)."),
     }
-    if m["head_tilt"] is not None:
-        insights["head_tilt"] = f"Average head tilt was {abs(m['head_tilt']):.0f}°."
+    if m["head_tilt_abs"] is not None:
+        insights["head_tilt"] = f"Average head tilt was {m['head_tilt_abs']:.0f}° from level."
 
     recs = []
     if wpm is not None:
@@ -192,7 +198,7 @@ def build_report(record: dict, ml_score: Optional[float], score_note: Optional[s
             recs.append("Pace was balanced and natural.")
     if posture is not None and posture < 70:
         recs.append("Maintain upright shoulders and balanced head alignment.")
-    if m["head_tilt"] is not None and abs(m["head_tilt"]) > 10:
+    if m["head_tilt_abs"] is not None and m["head_tilt_abs"] > 10:
         recs.append("Keep your head level — you tended to tilt it to one side.")
     if eye == "Looking Away":
         recs.append("Look toward the camera more often to build connection.")
