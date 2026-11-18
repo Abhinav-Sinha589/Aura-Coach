@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import Chart from "chart.js/auto";
 import "./ReportPage.css";
 import bg from "../../assets/background.png";
@@ -9,132 +9,81 @@ export default function ReportPage({ data, sessionId, onBack, backendUrl }) {
   const chartInstanceRef = useRef(null);
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [fetchError, setFetchError] = useState(null);
 
+  // Use the dynamic backend URL logic below
   const BACKEND_URL =
     backendUrl ||
     process.env.REACT_APP_BACKEND_URL ||
-    (typeof window !== "undefined" &&
-    window.location.hostname !== "localhost" &&
-    window.location.hostname !== "127.0.0.1"
+    (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1"
       ? window.location.origin
       : "http://127.0.0.1:8010");
 
-  // 🧠 Fetch report from FastAPI with AbortController / stale-response guard
+  // 🧠 Fetch report from FastAPI
   useEffect(() => {
-    let active = true;
-    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
-
-    if (!sessionId) {
-      setReport(null);
-      setFetchError("No session ID provided.");
-      setLoading(false);
-      return undefined;
-    }
-
-    setLoading(true);
-    setFetchError(null);
-    setReport(null);
-
     const fetchReport = async () => {
+      if (!sessionId) return;
       try {
         const response = await fetch(
-          `${BACKEND_URL}/api/report/${encodeURIComponent(sessionId)}`,
-          controller ? { signal: controller.signal } : undefined
+          `${BACKEND_URL}/api/report/${sessionId}`
         );
-        let result = null;
-        try {
-          result = await response.json();
-        } catch (_e) {
-          result = null;
-        }
-        if (!active) return;
-
-        if (!response.ok || !result || !result.report) {
-          const msg =
-            response.status === 404
-              ? "Session report not found (404)."
-              : result?.error || `Failed to load report (HTTP ${response.status}).`;
-          setFetchError(msg);
-          setReport(null);
-          return;
-        }
+        const result = await response.json();
+        console.log("📊 Report fetched:", result);
         setReport(result.report);
       } catch (error) {
-        if (!active || error?.name === "AbortError") return;
-        setFetchError("Unable to reach backend to load report.");
-        setReport(null);
+        console.error("❌ Error fetching report:", error);
       } finally {
-        if (active) {
-          setLoading(false);
-        }
+        setLoading(false);
       }
     };
-
     fetchReport();
-
-    return () => {
-      active = false;
-      if (controller) controller.abort();
-    };
+    // eslint-disable-next-line
   }, [sessionId, BACKEND_URL]);
 
-  const timeline = useMemo(
-    () =>
-      Array.isArray(report?.timeline)
-        ? report.timeline.filter(
-            (pt) =>
-              pt &&
-              typeof pt.t === "number" &&
-              Number.isFinite(pt.t) &&
-              ((typeof pt.posture === "number" && Number.isFinite(pt.posture)) ||
-                (typeof pt.wpm === "number" && Number.isFinite(pt.wpm)))
-          )
-        : [],
-    [report]
-  );
-  const hasRealTimeline = timeline.length >= 2;
-
-  // 📈 Draw chart ONLY when real timestamped checkpoints exist; clean up on unmount
+  // 📈 Draw chart AFTER report loads
   useEffect(() => {
+    if (!report || !data || !chartRef.current) return;
+
     if (chartInstanceRef.current) {
       chartInstanceRef.current.destroy();
-      chartInstanceRef.current = null;
     }
-    if (!hasRealTimeline || !chartRef.current) return undefined;
 
     const ctx = chartRef.current.getContext("2d");
-    const labels = timeline.map((pt) => `${Math.round(pt.t)}s`);
-    const postureSeries = timeline.map((pt) =>
-      typeof pt.posture === "number" && Number.isFinite(pt.posture) ? pt.posture : null
-    );
-    const wpmSeries = timeline.map((pt) =>
-      typeof pt.wpm === "number" && Number.isFinite(pt.wpm) ? pt.wpm : null
-    );
+
+    // Dynamic simulated trend data
+    const postureTrend = [
+      Math.max(50, data.posture - 10),
+      Math.max(55, data.posture - 5),
+      data.posture,
+      Math.min(95, data.posture + 5),
+    ];
+    const wpmTrend = [
+      Math.max(80, data.wpm - 30),
+      data.wpm - 10,
+      data.wpm,
+      Math.min(180, data.wpm + 15),
+    ];
 
     chartInstanceRef.current = new Chart(ctx, {
       type: "line",
       data: {
-        labels,
+        labels: ["Start", "1 min", "2 min", "3 min", "End"],
         datasets: [
           {
-            label: "Posture (%)",
-            data: postureSeries,
-            yAxisID: "yPosture",
+            label: "Confidence (Posture)",
+            data: postureTrend,
             borderColor: "rgba(125, 82, 245, 0.9)",
             backgroundColor: "rgba(110, 92, 226, 0.25)",
-            tension: 0.3,
-            spanGaps: true,
+            tension: 0.4,
+            fill: true,
             borderWidth: 2.5,
           },
           {
-            label: "Speaking Pace (WPM)",
-            data: wpmSeries,
-            yAxisID: "yWpm",
-            borderColor: "rgba(34, 197, 94, 0.9)",
-            backgroundColor: "rgba(74, 222, 128, 0.2)",
-            tension: 0.3,
-            spanGaps: true,
+            label: "Pacing (WPM)",
+            data: wpmTrend,
+            borderColor: "rgba(34,197,94,0.9)",
+            backgroundColor: "rgba(74,222,128,0.2)",
+            tension: 0.4,
+            fill: true,
             borderWidth: 2.5,
           },
         ],
@@ -142,36 +91,32 @@ export default function ReportPage({ data, sessionId, onBack, backendUrl }) {
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        animation: { duration: 1200, easing: "easeInOutQuart" },
         scales: {
-          yPosture: {
-            type: "linear",
-            position: "left",
-            min: 0,
-            max: 100,
-            title: { display: true, text: "Posture (%)" },
-          },
-          yWpm: {
-            type: "linear",
-            position: "right",
+          y: {
             beginAtZero: true,
-            grid: { drawOnChartArea: false },
-            title: { display: true, text: "WPM" },
+            suggestedMax: 100,
+            ticks: { color: "#4B5563", font: { size: 13 } },
+          },
+          x: {
+            ticks: { color: "#6B7280", font: { size: 12 } },
+          },
+        },
+        plugins: {
+          legend: {
+            position: "top",
+            labels: { color: "#4B5563", font: { size: 13, weight: 600 } },
           },
         },
       },
     });
+    // eslint-disable-next-line
+  }, [report, data]);
 
-    return () => {
-      if (chartInstanceRef.current) {
-        chartInstanceRef.current.destroy();
-        chartInstanceRef.current = null;
-      }
-    };
-  }, [hasRealTimeline, timeline]);
+  if (loading)
+    return <p className="loading glass">Loading report...</p>;
 
-  if (loading) return <p className="loading glass">Loading report...</p>;
-
-  if (!report) {
+  if (!report)
     return (
       <div className="report-root" style={{ backgroundImage: `url(${bg})` }}>
         <header className="topbar glass">
@@ -179,24 +124,12 @@ export default function ReportPage({ data, sessionId, onBack, backendUrl }) {
         </header>
         <div className="report-container glass">
           <h2>No report found 😕</h2>
-          {fetchError && <p>{fetchError}</p>}
           <button className="btn start" onClick={onBack}>
             ← Back to Home
           </button>
         </div>
       </div>
     );
-  }
-
-  // Prefer backend report.metrics for the selected sessionId (never overwrite with stale App props)
-  const m = report.metrics || data || {};
-  const formatNum = (val, decimals = 0, suffix = "") => {
-    if (typeof val !== "number" || !Number.isFinite(val)) return "Unavailable";
-    return `${decimals > 0 ? val.toFixed(decimals) : Math.round(val)}${suffix}`;
-  };
-
-  const insights = report.insights && typeof report.insights === "object" ? report.insights : {};
-  const recommendations = Array.isArray(report.recommendations) ? report.recommendations : [];
 
   return (
     <div className="report-root" style={{ backgroundImage: `url(${bg})` }}>
@@ -208,16 +141,12 @@ export default function ReportPage({ data, sessionId, onBack, backendUrl }) {
         {/* Summary */}
         <div className="glass overview-box">
           <h2>Session Summary</h2>
-          <p>{report.summary || "Session summary unavailable."}</p>
-          {typeof report.ml_performance_score === "number" && Number.isFinite(report.ml_performance_score) ? (
+          <p>{report.summary}</p>
+          {report.ml_performance_score !== null && report.ml_performance_score !== undefined && (
             <div className="ml-score-badge">
-              <span className="ml-score-label">🧠 Estimated Performance Score (heuristic model)</span>
-              <span className="ml-score-value">{report.ml_performance_score.toFixed(1)}/100</span>
+              <span className="ml-score-label">🧠 ML Performance Score</span>
+              <span className="ml-score-value">{report.ml_performance_score}/100</span>
             </div>
-          ) : (
-            <p className="ml-score-note">
-              Estimated score withheld (requires measured WPM and posture).
-            </p>
           )}
         </div>
 
@@ -225,49 +154,45 @@ export default function ReportPage({ data, sessionId, onBack, backendUrl }) {
         <div className="stats-row">
           <div className="glass box">
             <h3>WPM</h3>
-            <p className="big">{formatNum(m.wpm, 0)}</p>
+            <p className="big">{data.wpm}</p>
             <span>Words per Minute</span>
           </div>
           <div className="glass box">
             <h3>Posture</h3>
-            <p className="big">{formatNum(m.posture, 0, "%")}</p>
-            <span>Shoulder Alignment</span>
+            <p className="big">{data.posture}%</p>
+            <span>Body Alignment</span>
           </div>
           <div className="glass box">
-            <h3>Camera Alignment</h3>
-            <p className="big">{m.eyeContact || "Unavailable"}</p>
-            <span>Face Framing (approx.)</span>
+            <h3>Eye Contact</h3>
+            <p className="big">{data.eyeContact}</p>
+            <span>Engagement</span>
           </div>
           <div className="glass box">
             <h3>Volume</h3>
-            <p className="big">{formatNum(m.volume, 1)}</p>
-            <span>RMS × 100</span>
+            <p className="big">{data.volume?.toFixed(1)}</p>
+            <span>Voice Power</span>
           </div>
           <div className="glass box">
-            <h3>Expression</h3>
-            <p className="big">{m.emotion || "Unavailable"}</p>
-            <span>Facial Estimate</span>
+            <h3>Emotion</h3>
+            <p className="big">{data.emotion}</p>
+            <span>Expression</span>
           </div>
         </div>
 
         {/* Chart + Insights */}
         <div className="middle-row">
           <div className="glass chart-box" style={{ height: "320px" }}>
-            <h2>Pacing &amp; Posture Timeline</h2>
-            {hasRealTimeline ? (
-              <canvas ref={chartRef}></canvas>
-            ) : (
-              <p className="empty-timeline">No session timeline recorded</p>
-            )}
+            <h2>Pacing & Confidence Trend</h2>
+            <canvas ref={chartRef}></canvas>
           </div>
 
           <div className="glass feedback-box">
             <h2>Insights</h2>
             <ul>
-              {insights.posture && <li>{insights.posture}</li>}
-              {insights.eye_contact && <li>{insights.eye_contact}</li>}
-              {insights.emotion && <li>{insights.emotion}</li>}
-              {insights.tone && <li>{insights.tone}</li>}
+              <li>{report.insights.posture}</li>
+              <li>{report.insights.eye_contact}</li>
+              <li>{report.insights.emotion}</li>
+              {report.insights.tone && <li>{report.insights.tone}</li>}
             </ul>
           </div>
         </div>
@@ -276,7 +201,7 @@ export default function ReportPage({ data, sessionId, onBack, backendUrl }) {
         <div className="glass feedback-box">
           <h2>Recommendations</h2>
           <ul>
-            {recommendations.map((r, i) => (
+            {report.recommendations.map((r, i) => (
               <li key={i}>{r}</li>
             ))}
           </ul>

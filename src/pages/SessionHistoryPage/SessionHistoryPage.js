@@ -51,21 +51,17 @@ export default function SessionHistoryPage({ onBack, onOpenReport, backendUrl })
                 <th>Date</th>
                 <th>WPM</th>
                 <th>Posture</th>
-                <th>Expression</th>
+                <th>Emotion</th>
                 <th>Action</th>
               </tr>
             </thead>
             <tbody>
               {sessions.map((s) => (
                 <tr key={s.session_id}>
-                  <td>{s.timestamp ? new Date(s.timestamp).toLocaleString() : "—"}</td>
-                  <td>{typeof s.wpm === "number" && Number.isFinite(s.wpm) ? Math.round(s.wpm) : "—"}</td>
-                  <td>
-                    {typeof s.posture === "number" && Number.isFinite(s.posture)
-                      ? `${Math.round(s.posture)}%`
-                      : "—"}
-                  </td>
-                  <td>{s.emotion || "—"}</td>
+                  <td>{new Date(s.timestamp).toLocaleString()}</td>
+                  <td>{s.wpm}</td>
+                  <td>{s.posture}%</td>
+                  <td>{s.emotion}</td>
                   <td>
                     <button
                       className="btn small"

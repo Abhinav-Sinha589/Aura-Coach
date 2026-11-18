@@ -76,24 +76,19 @@ stays the same.
 ## How it's wired into the app
 
 - `backend/model_loader.py` loads both `.joblib` files once at FastAPI
-  startup (via FastAPI `lifespan`) and exposes `predict_performance_score()`
-  and `predict_tone()`. Inference applies the exact numeric clipping ranges
-  (`wpm: 0..260`, `posture: 0..100`, `fillers: 0..50`, `volume: 0..5`, `pitch: 0..500`)
-  and categorical fallback buckets (`eyeContact -> "Unknown"`, `tone -> "Neutral"`,
-  `emotion -> "Neutral"`) used in `train_performance_model.py:clean_sessions()`.
-  When essential inputs (`wpm` or `posture`) are unmeasured (`null`), the performance
-  score is withheld (`None`) rather than fabricated from zero defaults.
-- `/api/audio-stream` (WebSocket) buffers incoming PCM16LE audio into 1.5-second
-  analysis windows (0.5-second hop), resamples each complete window to 16 kHz,
-  and calls `predict_tone()` on voiced windows (`rms >= 0.001` and finite `pitch > 0`).
-  On silence or model unavailability, `pitch` and `tone` are returned as `null`.
-- `/api/report/{session_id}` includes `ml_performance_score`, `ml_imputed_features`,
-  and `ml_note` alongside the rule-based summary/insights/recommendations.
-- `/api/predict/performance` lets you POST an arbitrary feature set and get a
-  score back directly (returns HTTP 422 if essential inputs `wpm` or `posture` are missing).
-- `/api/models/status` is a health check confirming both models loaded.
-- The frontend (`ReportPage.js`) displays the estimated score badge next to the
-  session summary (or notes when it is withheld due to unmeasured essential inputs).
+  startup (`@app.on_event("startup")`) and exposes `predict_performance_score()`
+  and `predict_tone()`.
+- `/api/audio-stream` (websocket) now calls `predict_tone()` on every
+  audio chunk instead of the old threshold rule.
+- `/api/report/{session_id}` now includes an `ml_performance_score`
+  field alongside the existing rule-based summary/insights/recommendations.
+- `/api/predict/performance` (new) lets you POST an arbitrary feature
+  set and get a score back directly — handy for testing or a future
+  "what-if" feature in the UI.
+- `/api/models/status` (new) is a quick health check confirming both
+  models loaded.
+- The frontend (`ReportPage.js`) displays the ML score as a badge next
+  to the session summary.
 
 ## Training / retraining
 
@@ -108,5 +103,6 @@ Both scripts print evaluation metrics to the console and write:
 - `backend/models/performance_model.joblib` + `performance_model_meta.json`
 - `backend/models/tone_model.joblib` + `tone_model_meta.json`
 
-The `Dockerfile` copies the committed `.joblib` artifacts in `backend/models/`
-into the production image without running training during `docker build`.
+The Dockerfile now runs both training scripts during the image build,
+so a freshly built container ships with trained models already present
+(provided `data/raw/` has at least 10 sessions — seed it if needed).
