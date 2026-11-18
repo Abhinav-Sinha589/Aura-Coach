@@ -1,13 +1,15 @@
 # -------- STAGE 1: FRONTEND BUILD (React) --------
-FROM node:18-bullseye-slim AS frontend-build
+# Node 18 is end-of-life; CRA 5 builds cleanly on Node 20 LTS
+FROM node:20-bookworm-slim AS frontend-build
 
 WORKDIR /app
 
 # Install dependencies
 COPY package*.json ./
-RUN npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+RUN npm ci --legacy-peer-deps
 
 # Build the React frontend
+COPY jsconfig.json ./
 COPY public ./public
 COPY src ./src
 RUN npm run build

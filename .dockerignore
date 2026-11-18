@@ -11,3 +11,5 @@ data/raw/*.json
 .vscode
 .idea
 docs/screenshots
+backend/tests
+.pytest_cache

@@ -8,4 +8,5 @@ dist/
 data/raw/
 *.log
 .vscode/
-.idea/
+.idea/.pytest_cache/
+backend/tests/__pycache__/
