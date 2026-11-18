@@ -2,6 +2,9 @@
 
 A real-time public-speaking coach. Turn on your camera and mic, start talking, and Aura Coach watches your body language and listens to your voice — live — then scores the whole session with a trained ML model at the end.
 
+**🚀 Live demo: [aura-coach-1.onrender.com](https://aura-coach-1.onrender.com/)**  
+<sub>Use Chrome or Edge and allow camera + microphone. Hosted on Render's free tier — the first load after a period of inactivity can take ~30–60 s while the service wakes up, and session history resets on each redeploy.</sub>
+
 ## What the dashboard actually shows
 
 The live training screen is a three-panel layout: your camera feed in the center, with two stat panels on either side that update continuously while you speak. Any metric that can't be measured right now shows **—** (or a short status such as *Head not detected*, *No face*, *Listening…*) instead of a made-up 0.
