@@ -1,277 +1,407 @@
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-import os, json, uuid, io
+from contextlib import asynccontextmanager
+import asyncio
+import io
+import json
+import os
+import time
+import uuid
 from datetime import datetime
+
 import numpy as np
 import soundfile as sf
-import librosa
-from collections import defaultdict
+from fastapi import FastAPI, Request, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 try:
     # Works when run as `uvicorn backend.main:app` from the project root
-    from backend.model_loader import load_models, predict_performance_score, predict_tone, models_status
-    from backend.ml.audio_features import extract_features_from_waveform
+    from backend.model_loader import (
+        load_models, predict_performance_score, predict_tone_proba, models_status,
+    )
+    from backend.audio_pipeline import (
+        StreamAnalyzer, SessionAudioAggregate, decode_pcm16le, warm_up,
+        TRAINING_SAMPLE_RATE, TRAINING_WINDOW_SEC, DEFAULT_HOP_SEC,
+    )
+    from backend.sessions import (
+        is_valid_session_id, session_metrics, build_report, sanitize_client_payload,
+        missing_score_inputs,
+    )
 except ImportError:
     # Works when run from inside backend/ (e.g. `uvicorn main:app`)
-    from model_loader import load_models, predict_performance_score, predict_tone, models_status
-    from ml.audio_features import extract_features_from_waveform
+    from model_loader import (
+        load_models, predict_performance_score, predict_tone_proba, models_status,
+    )
+    from audio_pipeline import (
+        StreamAnalyzer, SessionAudioAggregate, decode_pcm16le, warm_up,
+        TRAINING_SAMPLE_RATE, TRAINING_WINDOW_SEC, DEFAULT_HOP_SEC,
+    )
+    from sessions import (
+        is_valid_session_id, session_metrics, build_report, sanitize_client_payload,
+        missing_score_inputs,
+    )
 
 
 # -------------------------------------------
 # 🚀 FASTAPI INITIAL SETUP
 # -------------------------------------------
-app = FastAPI()
-
-
-@app.on_event("startup")
-async def _load_ml_models():
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     # Loads backend/models/performance_model.joblib and tone_model.joblib
     load_models()
+    try:
+        # pyin is JIT-compiled on first use (~1 s); do it now, not mid-session
+        await asyncio.to_thread(warm_up)
+    except Exception as e:  # pragma: no cover
+        print(f"⚠️ audio warm-up failed: {e}")
+    yield
 
 
-# ✅ Production CORS setup — supports localhost, Dev Tunnels, and Render domains
+app = FastAPI(title="Aura Coach API", lifespan=lifespan)
+
+
+# CORS: the deployed app is same-origin (FastAPI serves the React build), so
+# CORS only matters for local dev / tunnels. No cookies or auth headers are
+# used, so credentials are off, which also keeps a "*" origin valid.
 raw_custom_origins = os.environ.get("ALLOWED_ORIGINS", "")
 custom_origins = [o.strip() for o in raw_custom_origins.split(",") if o.strip()]
-
 default_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "https://d32w6h95-3000.inc1.devtunnels.ms",
 ]
-allowed_origins = list(set(default_origins + custom_origins)) if "*" not in custom_origins else ["*"]
+allowed_origins = ["*"] if "*" in custom_origins else sorted(set(default_origins + custom_origins))
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r"https://.*(\.devtunnels\.ms|\.onrender\.com)",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origin_regex=os.environ.get("ALLOWED_ORIGIN_REGEX") or None,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
 
-# Directory for saving logs
-RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
+# Directory for saving logs (NOTE: Render's free-tier disk is ephemeral)
+RAW_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "raw"))
 os.makedirs(RAW_DIR, exist_ok=True)
 
+MAX_LOG_BYTES = 512 * 1024
+MAX_WS_FRAME_BYTES = 256 * 1024
+SESSION_TTL_SEC = 30 * 60
+HOP_SEC = float(os.environ.get("AUDIO_HOP_SEC", DEFAULT_HOP_SEC))
 
-# Dictionary to store active audio metrics temporarily
-SESSION_AUDIO_DATA = defaultdict(lambda: {"volume": [], "pitch": [], "tone": [], "wpm": []})
+# Live audio aggregates, keyed by session_id. Bounded online statistics only;
+# purged after SESSION_TTL_SEC of inactivity. Single-process state: run one
+# uvicorn worker (as the Dockerfile does) or move this to a shared store.
+SESSION_AUDIO_DATA: dict = {}
+_session_locks: dict = {}
+
+
+def _purge_stale_sessions():
+    now = time.time()
+    for sid in [s for s, a in SESSION_AUDIO_DATA.items() if now - a.last_seen > SESSION_TTL_SEC]:
+        SESSION_AUDIO_DATA.pop(sid, None)
+        _session_locks.pop(sid, None)
+
+
+def _lock_for(session_id: str) -> asyncio.Lock:
+    lock = _session_locks.get(session_id)
+    if lock is None:
+        lock = _session_locks[session_id] = asyncio.Lock()
+    return lock
+
+
+def _session_path(session_id: str) -> str:
+    """Only ever called with validated IDs; double-checks containment anyway."""
+    path = os.path.abspath(os.path.join(RAW_DIR, f"{session_id}.json"))
+    if os.path.dirname(path) != RAW_DIR:
+        raise ValueError("invalid session path")
+    return path
+
+
+def _read_json(path: str):
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def _write_json_atomic(path: str, data: dict):
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp, path)
+
+
+def _error(status: int, message: str):
+    return JSONResponse(status_code=status, content={"error": message})
 
 
 # -------------------------------------------
-# 🟢 Log a new training session (append/merge safe)
+# 🟢 Log a training session (idempotent per session_id)
 # -------------------------------------------
 @app.post("/api/session/log")
 async def log_session(req: Request):
     """
-    Store or update session metrics + audio summaries into a JSON file.
+    Store session metrics + the live-audio aggregate for the same session_id.
+    Posting the same session_id again merges into the existing record and is
+    reported as a duplicate (safe for retries / double clicks).
     """
-    data = await req.json()
+    body = await req.body()
+    if len(body) > MAX_LOG_BYTES:
+        return _error(413, "Session payload too large")
+    try:
+        data = json.loads(body or b"{}")
+    except Exception:
+        return _error(400, "Body must be JSON")
+    if not isinstance(data, dict):
+        return _error(400, "Body must be a JSON object")
+
     session_id = data.get("session_id") or f"session_{uuid.uuid4().hex}"
-    data["timestamp"] = datetime.now().isoformat()
+    if not is_valid_session_id(session_id):
+        return _error(400, "Invalid session_id")
+    data = sanitize_client_payload(data)
+    data["session_id"] = session_id
 
-    # If real-time audio data exists for this session, aggregate it
-    if session_id in SESSION_AUDIO_DATA:
-        audio_data = SESSION_AUDIO_DATA[session_id]
-        data["avg_volume"] = float(np.mean(audio_data["volume"])) if audio_data["volume"] else 0.0
-        data["avg_pitch"] = float(np.mean(audio_data["pitch"])) if audio_data["pitch"] else 0.0
-        data["avg_wpm"] = float(np.mean(audio_data["wpm"])) if audio_data["wpm"] else float(data.get("wpm", 0))
-        if audio_data["tone"]:
-            tones = audio_data["tone"]
-            data["dominant_tone"] = max(set(tones), key=tones.count)
-        else:
-            data["dominant_tone"] = "Neutral"
-        # clear stored audio after merging
-        del SESSION_AUDIO_DATA[session_id]
+    _purge_stale_sessions()
+    async with _lock_for(session_id):
+        file_path = _session_path(session_id)
+        existing = None
+        if os.path.exists(file_path):
+            try:
+                existing = _read_json(file_path)
+            except Exception:
+                existing = None
 
-    file_path = os.path.join(RAW_DIR, f"{session_id}.json")
+        record = dict(existing) if isinstance(existing, dict) else {}
+        record.update(data)
+        now = datetime.now().isoformat()
+        record.setdefault("timestamp", now)
+        if existing:
+            record["updated_at"] = now
 
-    # merge updates if file exists
-    if os.path.exists(file_path):
-        with open(file_path, "r") as f:
-            existing = json.load(f)
-        existing.update(data)
-        with open(file_path, "w") as f:
-            json.dump(existing, f, indent=4)
-    else:
-        with open(file_path, "w") as f:
-            json.dump(data, f, indent=4)
+        # Real speech-recognition WPM (finalised words / elapsed time). The
+        # old server-side `120 + rms*200` estimate is gone: WPM is never
+        # inferred from loudness.
+        wpm = data.get("wpm")
+        if "wpm" in data:
+            record["avg_wpm"] = wpm if isinstance(wpm, (int, float)) else None
 
-    print(f"✅ Session saved with live audio data → {file_path}")
-    return {"status": "ok", "session_id": session_id}
+        aggregate = SESSION_AUDIO_DATA.pop(session_id, None)
+        if aggregate is not None:
+            aggregate.finalized = True
+            record.update(aggregate.summary())
+        elif not existing:
+            measured = record.get("measured")
+            if isinstance(measured, dict) and measured.get("audio") is False:
+                record.update({"avg_volume": None, "avg_pitch": None, "dominant_tone": None})
+
+        await asyncio.to_thread(_write_json_atomic, file_path, record)
+
+    print(f"✅ Session saved → {os.path.basename(file_path)} (audio aggregate: {aggregate is not None})")
+    return {"status": "ok", "session_id": session_id, "duplicate": existing is not None}
 
 
 # -------------------------------------------
-# 🔊 Real-Time Audio Streaming with Progressive Storage
+# 🔊 Real-Time Audio Streaming
 # -------------------------------------------
 @app.websocket("/api/audio-stream")
 async def audio_stream(ws: WebSocket):
     """
-    Receives small audio chunks from frontend, analyzes live features,
-    stores them for session-level aggregation when frontend provides session_id.
-    Frontend may first send a JSON text message: {"session_id":"session_xxx"} to bind chunks.
+    Protocol (v2):
+      client → {"type":"start","session_id":..., "sample_rate":48000,
+                "channels":1, "encoding":"pcm_s16le"}
+      server → {"type":"ready", ...}
+      client → binary little-endian int16 mono PCM at sample_rate
+      server → {"type":"metrics", volume, pitch, tone, ...} every hop (0.5 s)
+      client → {"type":"stop"}  → server flushes the last window and replies
+      server → {"type":"final", "summary": {...}}  (then the client POSTs the log)
+    Legacy clients ({"session_id": ...} then raw PCM) are treated as 16 kHz.
     """
     await ws.accept()
+    send_lock = asyncio.Lock()
+    data_ready = asyncio.Event()
+    state = {"analyzer": None, "session_id": None, "closing": False, "stopping": False}
+    _purge_stale_sessions()
+
+    async def send(payload: dict):
+        async with send_lock:
+            await ws.send_json(payload)
+
+    def bind(session_id, sample_rate):
+        aggregate = None
+        if session_id:
+            aggregate = SESSION_AUDIO_DATA.get(session_id)
+            if aggregate is None:
+                aggregate = SESSION_AUDIO_DATA[session_id] = SessionAudioAggregate(session_id)
+        else:
+            aggregate = SessionAudioAggregate("unbound")
+        state["session_id"] = session_id
+        state["analyzer"] = StreamAnalyzer(
+            sample_rate, aggregate, tone_proba_fn=predict_tone_proba, hop_sec=HOP_SEC
+        )
+
+    async def run_analysis(final=False):
+        analyzer = state["analyzer"]
+        if analyzer is None:
+            return
+        try:
+            result = await asyncio.to_thread(analyzer.analyze, final)
+        except Exception as e:
+            print(f"⚠️ audio analysis failed: {e}")
+            return
+        if result is not None and not state["closing"]:
+            await send(result)
+
+    async def analysis_loop():
+        while True:
+            await data_ready.wait()
+            data_ready.clear()
+            analyzer = state["analyzer"]
+            while analyzer is not None and analyzer.has_hop():
+                await run_analysis()
+            if state["stopping"]:
+                return
+
+    analysis_task = asyncio.create_task(analysis_loop())
     print("🎙️ WebSocket audio stream connected")
-    sr = 16000
-    session_id = None
 
     try:
         while True:
             msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
 
-            # If frontend sends JSON control message with session_id
-            if "text" in msg and msg["text"]:
+            text = msg.get("text")
+            if text:
                 try:
-                    control = json.loads(msg["text"])
-                    if isinstance(control, dict) and control.get("session_id"):
-                        session_id = control.get("session_id")
-                        print(f"📝 Session ID bound: {session_id}")
-                except Exception:
-                    # not JSON control — ignore
-                    pass
-                continue
-
-            data = msg.get("bytes", None)
-            if not data:
-                continue
-
-            # Decode PCM16 or WAV
-            try:
-                y, _ = sf.read(io.BytesIO(data), dtype="float32")
-            except Exception:
-                try:
-                    y = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                    control = json.loads(text)
                 except Exception:
                     continue
+                if not isinstance(control, dict):
+                    continue
+                ctype = control.get("type", "start" if control.get("session_id") else None)
 
-            if len(y) < 100:
+                if ctype == "start":
+                    sid = control.get("session_id")
+                    if sid is not None and not is_valid_session_id(sid):
+                        await send({"type": "error", "error": "invalid session_id"})
+                        await ws.close(code=1008)
+                        break
+                    legacy = "sample_rate" not in control
+                    try:
+                        sr = int(control.get("sample_rate", TRAINING_SAMPLE_RATE))
+                        if control.get("encoding", "pcm_s16le") != "pcm_s16le":
+                            raise ValueError("encoding")
+                        if int(control.get("channels", 1)) != 1:
+                            raise ValueError("channels")
+                        bind(sid, sr)
+                    except (TypeError, ValueError) as e:
+                        await send({"type": "error", "error": f"unsupported audio format ({e})"})
+                        await ws.close(code=1003)
+                        break
+                    print(f"📝 Audio bound: {sid} @ {sr} Hz{' (legacy client)' if legacy else ''}")
+                    await send({
+                        "type": "ready", "session_id": sid,
+                        "input_sample_rate": sr,
+                        "analysis_sample_rate": TRAINING_SAMPLE_RATE,
+                        "window_sec": TRAINING_WINDOW_SEC, "hop_sec": HOP_SEC,
+                    })
+                elif ctype == "stop":
+                    # Drain: let in-flight analysis finish (never run two
+                    # analyses at once), then the trailing partial hop.
+                    state["stopping"] = True
+                    data_ready.set()
+                    try:
+                        await analysis_task
+                    except asyncio.CancelledError:
+                        pass
+                    analyzer = state["analyzer"]
+                    if analyzer is not None and analyzer.pending_samples() >= int(0.1 * analyzer.sr):
+                        await run_analysis(final=True)
+                    summary = analyzer.aggregate.summary() if analyzer else None
+                    await send({"type": "final", "session_id": state["session_id"], "summary": summary})
+                    state["closing"] = True
+                elif ctype == "abort":
+                    if state["session_id"]:
+                        SESSION_AUDIO_DATA.pop(state["session_id"], None)
+                    break
+                elif ctype == "ping":
+                    await send({"type": "pong"})
                 continue
 
-            # --- ML Feature Extraction (shared with backend/ml/train_tone_model.py) ---
-            features = extract_features_from_waveform(y, sr)
-            rms, pitch, pitch_std, spectral_centroid, zcr = features
-
-            # Basic noise gate: ignore extremely quiet chunks (mic silence)
-            if rms < 0.001:
-                # still send a small heartbeat so frontend knows server is alive
-                await ws.send_json({"volume": round(rms*100,2), "pitch": 0.0, "tone": "Noise", "wpm": 0})
+            data = msg.get("bytes")
+            if not data or state["closing"]:
+                continue
+            if len(data) > MAX_WS_FRAME_BYTES:
+                await send({"type": "error", "error": "audio frame too large; dropped"})
                 continue
 
-            # 🧠 ML tone classification (RandomForest trained on rms, pitch
-            # mean/std, spectral centroid, zero-crossing rate) instead of
-            # the old single-threshold rule. Falls back to the simple rule
-            # only if the model file hasn't been trained/loaded yet.
-            tone, tone_confidence = predict_tone(features)
-            if tone is None:
-                tone = "Calm" if rms < 0.02 else "Balanced" if rms < 0.05 else "Energetic"
-                tone_confidence = None
+            if state["analyzer"] is None:
+                # Legacy client that never sent a handshake: assume 16 kHz PCM16
+                bind(None, TRAINING_SAMPLE_RATE)
 
-            wpm_est = int(120 + (rms * 200))
+            if data[:4] == b"RIFF":
+                try:
+                    y, wav_sr = sf.read(io.BytesIO(data), dtype="float32")
+                    if y.ndim > 1:
+                        y = y.mean(axis=1)
+                    if wav_sr != state["analyzer"].sr:
+                        bind(state["session_id"], wav_sr)
+                except Exception:
+                    continue
+            else:
+                y = decode_pcm16le(data)
 
-            # store in-memory for session aggregation
-            if session_id:
-                SESSION_AUDIO_DATA[session_id]["volume"].append(rms * 100)
-                SESSION_AUDIO_DATA[session_id]["pitch"].append(pitch)
-                SESSION_AUDIO_DATA[session_id]["tone"].append(tone)
-                SESSION_AUDIO_DATA[session_id]["wpm"].append(wpm_est)
+            state["analyzer"].push(np.asarray(y, dtype=np.float32))
+            if state["analyzer"].has_hop():
+                data_ready.set()
 
-            # send live metrics back
-            await ws.send_json({
-                "volume": round(rms * 100, 2),
-                "pitch": round(float(pitch), 1),
-                "tone": tone,
-                "tone_confidence": round(tone_confidence, 3) if tone_confidence is not None else None,
-                "wpm": wpm_est,
-            })
-
-    except WebSocketDisconnect:
-        print("❌ WebSocket disconnected.")
     except Exception as e:
-        print("⚠️ Error in audio processing:", e)
+        print(f"⚠️ Error in audio stream: {type(e).__name__}: {e}")
     finally:
+        analysis_task.cancel()
+        try:
+            await analysis_task
+        except (asyncio.CancelledError, Exception):
+            pass
         print("🔴 Audio WebSocket closed.")
 
 
 # -------------------------------------------
 # 🧠 Generate Performance Report
 # -------------------------------------------
+def _score_record(record: dict):
+    """ML score + an honest note about which inputs were not measured."""
+    measured = record.get("measured") if isinstance(record.get("measured"), dict) else {}
+    if measured and not (measured.get("pose") or measured.get("speech")):
+        return None, "Not enough was measured in this session to score it."
+    score = predict_performance_score(record)
+    if score is None:
+        return None, "Performance model unavailable."
+    missing = missing_score_inputs(session_metrics(record))
+    note = None
+    if missing:
+        note = ("Not measured: " + ", ".join(missing)
+                + ". The model scored these with its training defaults.")
+    return score, note
+
+
 @app.get("/api/report/{session_id}")
 async def get_report(session_id: str):
-    file_path = os.path.join(RAW_DIR, f"{session_id}.json")
-
+    if not is_valid_session_id(session_id):
+        return _error(404, "Session not found")
+    file_path = _session_path(session_id)
     if not os.path.exists(file_path):
-        return {"error": "Session not found"}
+        return _error(404, "Session not found")
+    try:
+        record = _read_json(file_path)
+    except Exception:
+        return _error(500, "Session file is unreadable")
+    if not isinstance(record, dict):
+        return _error(500, "Session file is malformed")
 
-    with open(file_path, "r") as f:
-        data = json.load(f)
-
-    # Extract metrics
-    wpm = data.get("avg_wpm", data.get("wpm", 0))
-    posture = float(data.get("posture", 0))
-    eye_contact = data.get("eyeContact", "Unknown")
-    fillers = data.get("fillers", 0)
-    emotion = data.get("emotion", "Neutral")
-    tone = data.get("dominant_tone", data.get("tone", "Balanced"))
-    pitch = round(data.get("avg_pitch", 0), 1)
-    volume = round(data.get("avg_volume", 0), 1)
-
-    summary = f"You spoke at {int(wpm)} WPM with {fillers} filler words. Avg volume: {volume}, pitch: {pitch} Hz."
-
-    insights = {
-        "posture": f"Your posture score was {posture}%, showing {'strong alignment' if posture > 80 else 'room for improvement'}.",
-        "eye_contact": f"Eye contact was {eye_contact.lower()}, indicating {'engagement' if eye_contact == 'Good' else 'inconsistent focus'}.",
-        "emotion": f"Dominant facial emotion: {emotion}.",
-        "tone": f"Vocal tone was mostly {tone.lower()}.",
-    }
-
-    recs = []
-    if wpm < 120:
-        recs.append("Increase your speaking pace slightly for energy.")
-    elif wpm > 160:
-        recs.append("Slow down a bit for clarity and emphasis.")
-    else:
-        recs.append("Pace was balanced and natural.")
-
-    if posture < 70:
-        recs.append("Maintain upright shoulders and balanced head alignment.")
-    if fillers > 5:
-        recs.append("Reduce filler words such as 'um' and 'like' for smoother delivery.")
-    if tone.lower() == "calm":
-        recs.append("Consider adding energy to sound more engaging.")
-    if tone.lower() == "energetic":
-        recs.append("Good vocal projection — keep it controlled for clarity.")
-    if emotion.lower() in ["sad", "angry", "fearful"]:
-        recs.append("A warmer tone and expression can improve connection.")
-
-    if not recs:
-        recs.append("Excellent performance overall! Keep refining consistency.")
-
-    # 🧠 ML Performance Score — RandomForestRegressor trained on your past
-    # sessions (backend/ml/train_performance_model.py). This is a learned,
-    # data-driven score in addition to the rule-based summary/recs above —
-    # falls back to None if the model hasn't been trained/loaded yet.
-    ml_score = predict_performance_score({
-        "wpm": wpm,
-        "posture": posture,
-        "fillers": fillers,
-        "volume": data.get("avg_volume", data.get("volume", 0)),
-        "pitch": data.get("avg_pitch", data.get("pitch", 0)),
-        "eyeContact": eye_contact,
-        "tone": tone,
-        "emotion": emotion,
-    })
-
-    report = {
-        "summary": summary,
-        "insights": insights,
-        "recommendations": recs,
-        "ml_performance_score": round(ml_score, 1) if ml_score is not None else None,
-    }
-    return {"session_id": session_id, "report": report}
+    score, note = _score_record(record)
+    return {"session_id": session_id, "report": build_report(record, score, note)}
 
 
 # -------------------------------------------
@@ -280,16 +410,19 @@ async def get_report(session_id: str):
 @app.post("/api/predict/performance")
 async def predict_performance(req: Request):
     """
-    Lets the frontend (or a quick curl/Postman test) get an ML performance
-    score for an arbitrary feature set without needing a saved session file.
     Body example:
       {"wpm": 145, "posture": 82, "fillers": 2, "volume": 1.1,
-       "pitch": 180, "eyeContact": "Good", "tone": "Balanced", "emotion": "Confident"}
+       "pitch": 180, "eyeContact": "Good", "tone": "Balanced", "emotion": "Happy"}
     """
-    features = await req.json()
+    try:
+        features = await req.json()
+    except Exception:
+        return _error(400, "Body must be JSON")
+    if not isinstance(features, dict):
+        return _error(400, "Body must be a JSON object")
     score = predict_performance_score(features)
     if score is None:
-        return {"error": "Performance model not loaded. Run backend/ml/train_performance_model.py first."}
+        return _error(503, "Performance model not loaded.")
     return {"ml_performance_score": round(score, 1)}
 
 
@@ -305,40 +438,55 @@ async def model_status():
 # -------------------------------------------
 # 📋 List all saved sessions (for Session History page)
 # -------------------------------------------
-@app.get("/api/sessions")
-async def list_sessions():
-    """
-    Returns a lightweight summary of every saved session so the frontend
-    can render a history table without fetching each full report.
-    """
+def _list_sessions():
     sessions = []
     if os.path.isdir(RAW_DIR):
         for filename in os.listdir(RAW_DIR):
             if not filename.endswith(".json"):
                 continue
-            file_path = os.path.join(RAW_DIR, filename)
             try:
-                with open(file_path, "r") as f:
-                    data = json.load(f)
+                data = _read_json(os.path.join(RAW_DIR, filename))
             except Exception:
                 continue
-
+            if not isinstance(data, dict):
+                continue
+            sid = data.get("session_id", filename[:-5])
+            if not is_valid_session_id(sid):
+                continue
+            m = session_metrics(data)
             sessions.append({
-                "session_id": data.get("session_id", filename[:-5]),
+                "session_id": sid,
                 "timestamp": data.get("timestamp"),
-                "wpm": data.get("avg_wpm", data.get("wpm", 0)),
-                "posture": data.get("posture", 0),
-                "emotion": data.get("emotion", "Neutral"),
+                "wpm": m["wpm"],
+                "posture": m["posture"],
+                "emotion": m["emotion"],
+                "eyeContact": m["eye_contact"],
+                "tone": m["tone"],
             })
-
-    # newest sessions first
     sessions.sort(key=lambda s: s.get("timestamp") or "", reverse=True)
-    return {"sessions": sessions}
+    return sessions
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    """Lightweight summary of every saved session (newest first)."""
+    return {"sessions": await asyncio.to_thread(_list_sessions)}
 
 
 # -------------------------------------------
 # 🏠 Frontend Static Assets & SPA Routing
 # -------------------------------------------
+def resolve_build_file(build_dir: str, full_path: str):
+    """Path of a real file inside build_dir, or None (blocks ../ traversal)."""
+    if not full_path:
+        return None
+    root = os.path.realpath(build_dir)
+    requested = os.path.realpath(os.path.join(root, full_path))
+    if os.path.commonpath([requested, root]) != root or not os.path.isfile(requested):
+        return None
+    return requested
+
+
 BUILD_DIR = None
 candidate_paths = [
     os.path.join(os.path.dirname(__file__), "build"),
@@ -350,7 +498,7 @@ candidate_paths = [
 
 for p in candidate_paths:
     if os.path.exists(p) and os.path.isdir(p) and os.path.exists(os.path.join(p, "index.html")):
-        BUILD_DIR = os.path.abspath(p)
+        BUILD_DIR = os.path.realpath(p)
         break
 
 if BUILD_DIR:
@@ -365,19 +513,17 @@ if BUILD_DIR:
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
-        # Don't intercept API routes (safety check)
-        if full_path.startswith("api/") or full_path == "api":
-            return {"error": "API route not found"}
-        
-        # If requested file exists in build folder, serve it
-        requested_file = os.path.join(BUILD_DIR, full_path)
-        if full_path and os.path.exists(requested_file) and os.path.isfile(requested_file):
-            return FileResponse(requested_file)
-        
+        if full_path == "api" or full_path.startswith("api/"):
+            return _error(404, "API route not found")
+
+        # Only serve files that really live inside BUILD_DIR (no ../ traversal)
+        requested = resolve_build_file(BUILD_DIR, full_path)
+        if requested:
+            return FileResponse(requested)
+
         # Otherwise fallback to index.html for client-side routing
         return FileResponse(os.path.join(BUILD_DIR, "index.html"))
 else:
     @app.get("/")
     async def root():
         return {"message": "Aura Coach backend running with real-time persistent speech analysis ✅"}
-
